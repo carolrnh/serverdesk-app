@@ -74,6 +74,18 @@ def _extract_checkout_fields(session: dict[str, Any]) -> tuple[str | None, str |
     session_id = session.get("id")
     meta = session.get("metadata") or {}
     guild_id = meta.get("guild_id") if isinstance(meta, dict) else None
+    if not guild_id:
+        guild_id = session.get("client_reference_id")
+    if not guild_id:
+        for f in session.get("custom_fields") or []:
+            if not isinstance(f, dict):
+                continue
+            label = str((f.get("label") or {}).get("custom") or f.get("key") or "").lower()
+            if "server" in label or "guild" in label:
+                val = (f.get("text") or {}).get("value") or (f.get("numeric") or {}).get("value")
+                if val:
+                    guild_id = val
+                    break
     if guild_id is not None:
         guild_id = str(guild_id).strip() or None
     return (str(email).strip() if email else None, session_id, guild_id)
@@ -486,6 +498,72 @@ def thanks():
     return page, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
+# --- Paid-guild queue the ServerDesk bot pulls --------------------------------
+# The bot is a separate Render worker with its own disk, so the webhook only
+# queues guild IDs here; the bot polls /api/paid-guilds (Bearer PAID_SYNC_TOKEN),
+# writes them to its /var/data/paid_guilds.json, then acks. Polling every ~2 min
+# also keeps this free service awake, so the queue file survives in practice;
+# Stripe also retries failed deliveries.
+_PAID_QUEUE: set[str] = set()
+
+
+def _paid_queue_path() -> Path:
+    return Path(os.environ.get("PAID_QUEUE_PATH", "/tmp/serverdesk_paid_queue.json"))
+
+
+def _load_paid_queue() -> set[str]:
+    try:
+        data = json.loads(_paid_queue_path().read_text(encoding="utf-8"))
+        _PAID_QUEUE.update(str(x) for x in data.get("guild_ids", []))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    return _PAID_QUEUE
+
+
+def _save_paid_queue() -> None:
+    try:
+        _paid_queue_path().write_text(json.dumps({"guild_ids": sorted(_PAID_QUEUE)}), encoding="utf-8")
+    except OSError as exc:
+        log.warning("paid queue save failed: %s", exc)
+
+
+def queue_paid_guild(guild_id: str | None) -> bool:
+    gid = str(guild_id or "").strip()
+    if not gid.isdigit() or not (15 <= len(gid) <= 21):
+        return False
+    _load_paid_queue().add(gid)
+    _save_paid_queue()
+    log.info("queued paid guild %s for bot unlock", gid)
+    return True
+
+
+def _sync_authorized() -> bool:
+    token = os.environ.get("PAID_SYNC_TOKEN", "").strip()
+    got = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+    import hmac
+
+    return bool(token) and hmac.compare_digest(token, got)
+
+
+@app.get("/api/paid-guilds")
+def paid_guilds_pending():
+    if not _sync_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify({"guild_ids": sorted(_load_paid_queue())}), 200
+
+
+@app.post("/api/paid-guilds/ack")
+def paid_guilds_ack():
+    if not _sync_authorized():
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    _load_paid_queue()
+    for gid in body.get("guild_ids") or []:
+        _PAID_QUEUE.discard(str(gid))
+    _save_paid_queue()
+    return jsonify({"ok": True, "remaining": len(_PAID_QUEUE)}), 200
+
+
 @app.post("/webhooks/stripe")
 def stripe_webhook():
     payload = request.get_data()
@@ -506,6 +584,10 @@ def stripe_webhook():
 
     obj = (event.get("data") or {}).get("object") or {}
     email, session_id, guild_id = _extract_checkout_fields(obj)
+    queued = False
+    # Only auto-unlock on signature-verified, actually-paid sessions.
+    if _webhook_secret() and obj.get("payment_status") in ("paid", "no_payment_required"):
+        queued = queue_paid_guild(guild_id)
     if not email:
         return jsonify({"error": "checkout session missing customer email"}), 400
 
@@ -532,6 +614,7 @@ def stripe_webhook():
             "email": email,
             "session_id": session_id,
             "guild_id": guild_id,
+            "guild_queued_for_unlock": queued,
             "packet": str(path),
             "emailed": emailed,
             "thanks": f"/thanks?session_id={session_id}" if session_id else None,
